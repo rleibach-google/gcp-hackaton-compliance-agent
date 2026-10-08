@@ -1,79 +1,77 @@
-# ruff: noqa
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-import datetime
-from zoneinfo import ZoneInfo
-
-from google.adk.agents import Agent
-from google.adk.apps import App
-from google.adk.models import Gemini
-from google.genai import types
-
 import os
+
 import google.auth
+import google.auth.transport.requests
+from google.adk.agents import Agent
+from google.adk.tools.bigquery import BigQueryCredentialsConfig, BigQueryToolset
+from google.adk.tools.bigquery.config import BigQueryToolConfig, WriteMode
 
-_, project_id = google.auth.default()
-os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
-os.environ["GOOGLE_CLOUD_LOCATION"] = "global"
-os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "True"
+# Same credential setup that works for the Trends agent
+credentials, adc_project = google.auth.default(
+    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+)
+credentials.refresh(google.auth.transport.requests.Request())
 
+# Project that runs (and pays for) the query jobs
+BILLING_PROJECT = (
+    os.getenv("GOOGLE_CLOUD_PROJECT")
+    or adc_project
+    or "qwiklabs-gcp-02-e8a2ec6ac646"
+)
 
-def get_weather(query: str) -> str:
-    """Simulates a web search. Use it get information on weather.
+bigquery_toolset = BigQueryToolset(
+    credentials_config=BigQueryCredentialsConfig(credentials=credentials),
+    bigquery_tool_config=BigQueryToolConfig(write_mode=WriteMode.BLOCKED),
+)
 
-    Args:
-        query: A string containing the location to get weather information for.
+TABLE = "bigquery-public-data.cfpb_complaints.complaint_database"
 
-    Returns:
-        A string with the simulated weather information for the queried location.
-    """
-    if "sf" in query.lower() or "san francisco" in query.lower():
-        return "It's 60 degrees and foggy."
-    return "It's 90 degrees and sunny."
+INSTRUCTION = f"""\
+You are a Complaint Risk Intelligence analyst for compliance, risk, and
+customer-experience teams at banks and fintechs. You analyze CFPB consumer
+complaint data in BigQuery and turn it into clear risk insights.
 
+## IMPORTANT: which project runs the queries
+- Whenever a tool asks for project_id to run a query (execute_sql and
+  similar), ALWAYS use "{BILLING_PROJECT}".
+- NEVER use "bigquery-public-data" as the project_id for execute_sql.
+  That project only holds the data. You can't run jobs there.
+- For metadata tools (get_table_info, list_table_ids), use
+  project_id="bigquery-public-data", dataset_id="cfpb_complaints".
+- In SQL, always use the full table name: `{TABLE}`
 
-def get_current_time(query: str) -> str:
-    """Simulates getting the current time for a city.
+## Data
+Key columns (confirm with get_table_info before your first query):
+complaint_id, date_received, product, subproduct, issue, subissue,
+company_name, state, submitted_via, company_response_to_consumer,
+timely_response, consumer_disputed, consumer_complaint_narrative.
 
-    Args:
-        city: The name of the city to get the current time for.
+## Rules
+1. First find the latest date with SELECT MAX(date_received). Treat
+   "last 12 months" as relative to that date, not today.
+2. Always filter on date_received. Default: last 12 months.
+3. Use LIMIT 20 unless asked for more. Never SELECT *.
+4. Read-only. Never run DDL or DML.
+5. Match company and product names with LOWER(...) LIKE '%...%'.
+6. Don't quote raw complaint narratives unless asked.
 
-    Returns:
-        A string with the current time information.
-    """
-    if "sf" in query.lower() or "san francisco" in query.lower():
-        tz_identifier = "America/Los_Angeles"
-    else:
-        return f"Sorry, I don't have timezone information for query: {query}."
+Risk signals: volume growth, untimely responses (timely_response = FALSE),
+and concentration in one issue or state.
+Risk score = YoY complaint growth x untimely-response rate
+(only companies with 500 or more complaints).
 
-    tz = ZoneInfo(tz_identifier)
-    now = datetime.datetime.now(tz)
-    return f"The current time for query {query} is {now.strftime('%Y-%m-%d %H:%M:%S %Z%z')}"
-
+Answer format: a one-line headline, a short markdown table,
+"Risk signals" bullets, and one suggested follow-up question.
+"""
 
 root_agent = Agent(
-    name="root_agent",
-    model=Gemini(
-        model="gemini-3-flash-preview",
-        retry_options=types.HttpRetryOptions(attempts=3),
-    ),
-    instruction="You are a helpful AI assistant designed to provide accurate and useful information.",
-    tools=[get_weather, get_current_time],
+    name="complaints_risk_agent",
+    model="gemini-2.5-flash",
+    description="Analyzes CFPB consumer complaints to surface compliance and CX risk.",
+    instruction=INSTRUCTION,
+    tools=[bigquery_toolset],
 )
+# Export both root_agent (for local ADK web) and app (for backend deployment)
 
-app = App(
-    root_agent=root_agent,
-    name="app",
-)
+app = root_agent 
+
